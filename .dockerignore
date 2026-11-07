@@ -1,0 +1,10 @@
+.git
+.gitignore
+.github
+*.test
+*.out
+*.prof
+coverage*
+.dockerignore
+Dockerfile
+README.md
