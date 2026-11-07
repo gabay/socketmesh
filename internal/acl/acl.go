@@ -12,9 +12,8 @@ import (
 
 // Reason messages returned by Check and Middleware.
 const (
-	ReasonReadOnly             = "method not allowed: socketmesh is strictly read-only"
-	ReasonEventsNotImplemented = "events endpoint is not supported"
-	ReasonACLDenied            = "access denied by socketmesh ACL"
+	ReasonReadOnly  = "method not allowed: socketmesh is strictly read-only"
+	ReasonACLDenied = "access denied by socketmesh ACL"
 )
 
 var versionRegex = regexp.MustCompile(`^(/v\d+\.\d+)(/.*)?$`)
@@ -52,10 +51,6 @@ func Check(method string, rawPath string, cfg config.ACLConfig) (status int, rea
 
 	_, cleanPath := StripVersionPrefix(rawPath)
 
-	if cleanPath == "/events" || strings.HasPrefix(cleanPath, "/events/") {
-		return http.StatusNotImplemented, ReasonEventsNotImplemented
-	}
-
 	switch {
 	case cleanPath == "/_ping":
 		if cfg.Ping {
@@ -67,6 +62,10 @@ func Check(method string, rawPath string, cfg config.ACLConfig) (status int, rea
 		}
 	case cleanPath == "/info":
 		if cfg.Info {
+			return http.StatusOK, ""
+		}
+	case matchCategory(cleanPath, "/events"):
+		if cfg.Events {
 			return http.StatusOK, ""
 		}
 	case matchCategory(cleanPath, "/containers"):

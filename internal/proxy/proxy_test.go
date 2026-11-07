@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +36,7 @@ func testACL() config.ACLConfig {
 		System:       true,
 		Distribution: true,
 		Plugins:      true,
+		Events:       true,
 	}
 }
 
@@ -729,10 +733,11 @@ func TestProxy_RequestTimeout(t *testing.T) {
 
 // Test 9: ACL Integration
 // - POST /containers/create -> 403 Forbidden
-// - GET /events -> 501 Not Implemented
+// - GET /events -> 403 Forbidden when Events=false, 200 OK when Events=true
 // - Disallowed category -> 403 Forbidden
 func TestProxy_ACLIntegration(t *testing.T) {
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `[]`)
 	}))
 	defer node.Close()
@@ -743,6 +748,7 @@ func TestProxy_ACLIntegration(t *testing.T) {
 			Ping:       true,
 			Containers: true,
 			Images:     false, // explicitly disallowed
+			Events:     false, // default disabled
 		},
 	}
 
@@ -760,11 +766,26 @@ func TestProxy_ACLIntegration(t *testing.T) {
 		t.Fatalf("expected 403 for POST, got %d", recPost.Code)
 	}
 
-	// GET /events -> 501 Not Implemented
+	// GET /events when Events is false -> 403 Forbidden
 	recEvents := httptest.NewRecorder()
 	p.ServeHTTP(recEvents, httptest.NewRequest(http.MethodGet, "/events", nil))
-	if recEvents.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501 for /events, got %d", recEvents.Code)
+	if recEvents.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for disallowed Events ACL, got %d", recEvents.Code)
+	}
+
+	// GET /events when Events is true -> 200 OK
+	cfgEvents := &config.Config{
+		Hosts: []string{node.URL},
+		ACL: config.ACLConfig{
+			Events: true,
+		},
+	}
+	discEvents, _ := discovery.NewManager(cfgEvents)
+	pEvents := NewProxy(cfgEvents, discEvents)
+	recEventsEnabled := httptest.NewRecorder()
+	pEvents.ServeHTTP(recEventsEnabled, httptest.NewRequest(http.MethodGet, "/events", nil))
+	if recEventsEnabled.Code != http.StatusOK {
+		t.Fatalf("expected 200 for allowed Events ACL, got %d", recEventsEnabled.Code)
 	}
 
 	// GET /images/json when Images is false -> 403
@@ -779,5 +800,586 @@ func TestProxy_ACLIntegration(t *testing.T) {
 	p.ServeHTTP(recContainers, httptest.NewRequest(http.MethodGet, "/containers/json", nil))
 	if recContainers.Code != http.StatusOK {
 		t.Fatalf("expected 200 for allowed Containers ACL, got %d", recContainers.Code)
+	}
+}
+
+// Test 14: Events Fan-Out merging streams from 2+ downstreams and populating container affinity
+func TestProxy_EventsFanOutAndAffinity(t *testing.T) {
+	ev1 := `{"Type":"container","Action":"start","Actor":{"ID":"c111111111111111111111111111111111111111111111111111111111111111","Attributes":{"name":"web-app"}}}`
+	ev2 := `{"Type":"container","Action":"die","Actor":{"ID":"c111111111111111111111111111111111111111111111111111111111111111","Attributes":{"name":"web-app"}}}`
+	ev3 := `{"Type":"container","Action":"create","Actor":{"ID":"c222222222222222222222222222222222222222222222222222222222222222","Attributes":{"name":"db-app"}}}`
+
+	node1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			flusher, ok := w.(http.Flusher)
+			if r.Method == http.MethodHead {
+				return
+			}
+			_, _ = fmt.Fprintf(w, "%s\n", ev1)
+			if ok {
+				flusher.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+			_, _ = fmt.Fprintf(w, "%s\n", ev2)
+			if ok {
+				flusher.Flush()
+			}
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer node1.Close()
+
+	node2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			flusher, ok := w.(http.Flusher)
+			if r.Method == http.MethodHead {
+				return
+			}
+			_, _ = fmt.Fprintf(w, "%s\n", ev3)
+			if ok {
+				flusher.Flush()
+			}
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer node2.Close()
+
+	cfg := &config.Config{
+		Hosts:          []string{node1.URL, node2.URL},
+		DNSRefresh:     15 * time.Second,
+		HealthInterval: 10 * time.Second,
+		ACL:            testACL(),
+	}
+
+	disc, err := discovery.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery: %v", err)
+	}
+
+	p := NewProxy(cfg, disc, WithEventsPollInterval(20*time.Millisecond))
+
+	// Test HEAD /events
+	recHead := httptest.NewRecorder()
+	p.ServeHTTP(recHead, httptest.NewRequest(http.MethodHead, "/events", nil))
+	if recHead.Code != http.StatusOK {
+		t.Fatalf("HEAD /events code = %d, want 200", recHead.Code)
+	}
+	if recHead.Body.Len() != 0 {
+		t.Fatalf("HEAD /events body length = %d, want 0", recHead.Body.Len())
+	}
+
+	// Test GET /events
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/events", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /events code = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	lines := strings.Split(strings.TrimSpace(body), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 streamed event lines, got %d: %v", len(lines), lines)
+	}
+
+	// Verify all 3 events are present
+	if !strings.Contains(body, "web-app") || !strings.Contains(body, "db-app") {
+		t.Fatalf("missing expected event content in response:\n%s", body)
+	}
+
+	// Verify opportunistic affinity caching
+	if ep, ok := p.Affinity().GetContainer("web-app"); !ok || ep != node1.URL {
+		t.Errorf("affinity for web-app = %q (ok=%v), want %q", ep, ok, node1.URL)
+	}
+	if ep, ok := p.Affinity().GetContainer("c111111111111"); !ok || ep != node1.URL {
+		t.Errorf("affinity for c111111111111 = %q (ok=%v), want %q", ep, ok, node1.URL)
+	}
+	if ep, ok := p.Affinity().GetContainer("db-app"); !ok || ep != node2.URL {
+		t.Errorf("affinity for db-app = %q (ok=%v), want %q", ep, ok, node2.URL)
+	}
+}
+
+// Test 15: Dynamic Node Addition during /events stream
+func TestProxy_EventsDynamicNodeAddition(t *testing.T) {
+	node1Done := make(chan struct{})
+	node2Connected := make(chan struct{})
+
+	node1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			flusher, ok := w.(http.Flusher)
+			_, _ = io.WriteString(w, `{"Type":"container","Action":"start","Actor":{"ID":"c1","Attributes":{"name":"node1-app"}}}`+"\n")
+			if ok {
+				flusher.Flush()
+			}
+			// Keep stream open until node2 connects and streams
+			select {
+			case <-node1Done:
+			case <-time.After(3 * time.Second):
+			}
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer node1.Close()
+
+	var node2Since atomic.Value
+	var node2Once sync.Once
+	node2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/events") {
+			node2Since.Store(r.URL.Query().Get("since"))
+			w.Header().Set("Content-Type", "application/json")
+			flusher, ok := w.(http.Flusher)
+			_, _ = io.WriteString(w, `{"Type":"container","Action":"start","Actor":{"ID":"c2","Attributes":{"name":"node2-app"}}}`+"\n")
+			if ok {
+				flusher.Flush()
+			}
+			node2Once.Do(func() {
+				close(node2Connected)
+			})
+			// Small sleep to ensure event was delivered
+			time.Sleep(20 * time.Millisecond)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer node2.Close()
+
+	cfg := &config.Config{
+		Hosts:          []string{node1.URL, node2.URL},
+		DNSRefresh:     15 * time.Second,
+		HealthInterval: 10 * time.Second,
+		ACL:            testACL(),
+	}
+
+	disc, err := discovery.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery: %v", err)
+	}
+
+	// Initially mark node2 unhealthy so it is NOT active
+	disc.MarkUnhealthy(node2.URL)
+
+	p := NewProxy(cfg, disc, WithEventsPollInterval(20*time.Millisecond))
+	proxyServer := httptest.NewServer(p)
+	defer proxyServer.Close()
+
+	// Client starts streaming /events
+	resp, err := http.Get(proxyServer.URL + "/events")
+	if err != nil {
+		t.Fatalf("failed to GET /events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	// Read first line from node1
+	line1, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("failed to read line1: %v", err)
+	}
+	if !strings.Contains(line1, "node1-app") {
+		t.Fatalf("expected node1-app in line1, got: %s", line1)
+	}
+
+	// Now dynamically mark node2 healthy!
+	disc.MarkHealthy(node2.URL)
+
+	// Wait for node2 to receive connection
+	select {
+	case <-node2Connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dynamic node2 connection")
+	}
+
+	// Let node1 close cleanly now
+	close(node1Done)
+
+	// Read line from node2
+	line2, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("failed to read line2: %v", err)
+	}
+	if !strings.Contains(line2, "node2-app") {
+		t.Fatalf("expected node2-app in line2, got: %s", line2)
+	}
+
+	// Verify dynamically added node received since query parameter
+	sinceVal, _ := node2Since.Load().(string)
+	if sinceVal == "" {
+		t.Errorf("expected since query parameter on dynamically connected node2, got empty")
+	}
+
+	// Verify affinity cache for node2-app
+	if ep, ok := p.Affinity().GetContainer("node2-app"); !ok || ep != node2.URL {
+		t.Errorf("affinity for node2-app = %q (ok=%v), want %q", ep, ok, node2.URL)
+	}
+}
+
+// Test 16: Partial downstream failure during /events connection
+func TestProxy_EventsPartialFailure(t *testing.T) {
+	// Node 1 fails immediately
+	brokenNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}))
+	defer brokenNode.Close()
+
+	healthyNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"Type":"container","Action":"start","Actor":{"ID":"c_healthy","Attributes":{"name":"healthy-app"}}}`+"\n")
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer healthyNode.Close()
+
+	cfg := &config.Config{
+		Hosts:          []string{brokenNode.URL, healthyNode.URL},
+		DNSRefresh:     15 * time.Second,
+		HealthInterval: 10 * time.Second,
+		ACL:            testACL(),
+	}
+
+	disc, err := discovery.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery: %v", err)
+	}
+
+	p := NewProxy(cfg, disc)
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/events", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from healthy downstream, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if !strings.Contains(rec.Body.String(), "healthy-app") {
+		t.Fatalf("expected healthy-app in response body, got: %s", rec.Body.String())
+	}
+
+	// Broken node should have been marked unhealthy in discovery
+	if disc.IsHealthy(brokenNode.URL) {
+		t.Errorf("expected broken node %q to be marked unhealthy", brokenNode.URL)
+	}
+	if !disc.IsHealthy(healthyNode.URL) {
+		t.Errorf("expected healthy node %q to remain healthy", healthyNode.URL)
+	}
+}
+
+// Test 17: All downstreams fail initially -> 502 Bad Gateway
+func TestProxy_EventsAllDownstreamsFail(t *testing.T) {
+	brokenNode1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error 1", http.StatusInternalServerError)
+	}))
+	defer brokenNode1.Close()
+
+	brokenNode2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error 2", http.StatusInternalServerError)
+	}))
+	defer brokenNode2.Close()
+
+	cfg := &config.Config{
+		Hosts:          []string{brokenNode1.URL, brokenNode2.URL},
+		DNSRefresh:     15 * time.Second,
+		HealthInterval: 10 * time.Second,
+		ACL:            testACL(),
+	}
+
+	disc, err := discovery.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery: %v", err)
+	}
+
+	p := NewProxy(cfg, disc)
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/events", nil))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Test 18: Client disconnect cancels /events downstream requests promptly
+func TestProxy_EventsClientCancel(t *testing.T) {
+	serverConnected := make(chan struct{})
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		flusher, ok := w.(http.Flusher)
+		_, _ = io.WriteString(w, `{"Type":"container","Action":"start","Actor":{"ID":"c1","Attributes":{"name":"stream-app"}}}`+"\n")
+		if ok {
+			flusher.Flush()
+		}
+		close(serverConnected)
+		// Wait until client cancels
+		<-r.Context().Done()
+	}))
+	defer node.Close()
+
+	cfg := &config.Config{
+		Hosts:          []string{node.URL},
+		DNSRefresh:     15 * time.Second,
+		HealthInterval: 10 * time.Second,
+		ACL:            testACL(),
+	}
+
+	disc, err := discovery.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery: %v", err)
+	}
+
+	p := NewProxy(cfg, disc)
+	proxyServer := httptest.NewServer(p)
+	defer proxyServer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, proxyServer.URL+"/events", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	select {
+	case <-serverConnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server connection")
+	}
+
+	// Cancel client context
+	cancel()
+
+	// Reading should terminate promptly with error or EOF
+	buf := make([]byte, 1024)
+	done := make(chan struct{})
+	go func() {
+		for {
+			_, err := resp.Body.Read(buf)
+			if err != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stream body read after cancellation")
+	}
+}
+
+func TestProxy_StreamEvents_FanOutAndCloseAll(t *testing.T) {
+	node1Close := make(chan struct{})
+	node2Close := make(chan struct{})
+
+	node1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1.45/events" && r.URL.Path != "/events" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `{"Type":"container","Action":"start","Actor":{"ID":"1111111111112222222222223333333333334444444444445555555555556666","Attributes":{"name":"web-node1"}}}`+"\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		<-node1Close
+	}))
+	defer node1.Close()
+
+	node2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1.45/events" && r.URL.Path != "/events" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `{"Type":"container","Action":"start","Actor":{"ID":"aaaaaaaabbbbccccddddeeeeffff000011112222333344445555666677778888","Attributes":{"name":"api-node2"}}}`+"\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		<-node2Close
+	}))
+	defer node2.Close()
+
+	cfg := &config.Config{
+		Hosts: []string{node1.URL, node2.URL},
+		ACL: config.ACLConfig{
+			Events:     true,
+			Containers: true,
+		},
+	}
+	disc, err := discovery.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery: %v", err)
+	}
+	p := NewProxy(cfg, disc)
+	proxySrv := httptest.NewServer(p)
+	defer proxySrv.Close()
+
+	// Node 1 closes first, Node 2 closes shortly after -> proxy stream should close only after both close
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		close(node1Close)
+		time.Sleep(30 * time.Millisecond)
+		close(node2Close)
+	}()
+
+	resp, err := http.Get(proxySrv.URL + "/v1.45/events")
+	if err != nil {
+		t.Fatalf("GET /events failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed reading /events body: %v", err)
+	}
+	body := string(bodyBytes)
+	if !strings.Contains(body, "web-node1") || !strings.Contains(body, "api-node2") {
+		t.Fatalf("expected events from both node1 and node2, got:\n%s", body)
+	}
+
+	// Verify opportunistic affinity population from container events
+	if ep, ok := p.Affinity().GetContainer("web-node1"); !ok || ep != node1.URL {
+		t.Errorf("expected web-node1 affinity -> %s, got %q (ok=%v)", node1.URL, ep, ok)
+	}
+	if ep, ok := p.Affinity().GetContainer("api-node2"); !ok || ep != node2.URL {
+		t.Errorf("expected api-node2 affinity -> %s, got %q (ok=%v)", node2.URL, ep, ok)
+	}
+}
+
+func TestProxy_StreamEvents_DynamicNodeAddition(t *testing.T) {
+	node1Close := make(chan struct{})
+	node2Connected := make(chan struct{})
+
+	node1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `{"Type":"container","Action":"start","Actor":{"ID":"node1container","Attributes":{"name":"from-node1"}}}`+"\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		<-node1Close
+	}))
+	defer node1.Close()
+
+	var node2Once sync.Once
+	node2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `{"Type":"container","Action":"start","Actor":{"ID":"node2container","Attributes":{"name":"from-node2-dynamic"}}}`+"\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		node2Once.Do(func() {
+			close(node2Connected)
+		})
+	}))
+	defer node2.Close()
+
+	// Initially only node1 is healthy; node2 starts unhealthy and recovers dynamically
+	cfg := &config.Config{
+		Hosts: []string{node1.URL, node2.URL},
+		ACL: config.ACLConfig{
+			Events: true,
+		},
+	}
+
+	disc, err := discovery.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery: %v", err)
+	}
+	// Mark node2 unhealthy before starting /events so only node1 is connected initially
+	disc.MarkUnhealthy(node2.URL)
+
+	p := NewProxy(cfg, disc, WithEventsPollInterval(20*time.Millisecond))
+	proxySrv := httptest.NewServer(p)
+	defer proxySrv.Close()
+
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		// Node 2 recovers (or is newly discovered) while /events stream is active
+		disc.MarkHealthy(node2.URL)
+		<-node2Connected
+		time.Sleep(20 * time.Millisecond)
+		close(node1Close)
+	}()
+
+	resp, err := http.Get(proxySrv.URL + "/events")
+	if err != nil {
+		t.Fatalf("GET /events failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed reading /events body: %v", err)
+	}
+	body := string(bodyBytes)
+	if !strings.Contains(body, "from-node1") {
+		t.Fatalf("missing event from initial node1, got:\n%s", body)
+	}
+	if !strings.Contains(body, "from-node2-dynamic") {
+		t.Fatalf("missing event from dynamically added node2, got:\n%s", body)
+	}
+}
+
+func TestProxy_StreamEvents_PartialFailure(t *testing.T) {
+	// Node 1 is closed (dead)
+	deadNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := deadNode.URL
+	deadNode.Close()
+
+	// Node 2 is healthy and streams an event then closes
+	liveNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"Type":"network","Action":"create","Actor":{"ID":"net1"}}`+"\n")
+	}))
+	defer liveNode.Close()
+
+	cfg := &config.Config{
+		Hosts: []string{deadURL, liveNode.URL},
+		ACL: config.ACLConfig{
+			Events: true,
+		},
+	}
+	disc, err := discovery.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery: %v", err)
+	}
+	p := NewProxy(cfg, disc)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on partial failure, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"ID":"net1"`) {
+		t.Fatalf("expected event from live node, got %s", rec.Body.String())
+	}
+	if disc.IsHealthy(deadURL) {
+		t.Errorf("expected deadNode %s to be marked unhealthy", deadURL)
 	}
 }

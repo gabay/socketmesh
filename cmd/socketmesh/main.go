@@ -152,10 +152,6 @@ func run(ctx context.Context, args []string, getenv func(string) string, opts ..
 		logger.Warn("Write/mutating environment variables detected; SocketMesh is strictly read-only by design and will block all write requests")
 	}
 
-	if cfg.ACL.Events {
-		logger.Warn("EVENTS=1 is set, but /events is not implemented and will return 501 Not Implemented")
-	}
-
 	mgr, err := discovery.NewManager(cfg, discovery.WithLogger(logger))
 	if err != nil {
 		return fmt.Errorf("failed to initialize discovery manager: %w", err)

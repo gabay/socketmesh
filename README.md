@@ -51,6 +51,7 @@ flowchart TD
 | Strategy | Endpoints | Behavior |
 | :--- | :--- | :--- |
 | **Fan-Out & Merge** | `GET /containers/json`<br>`GET /images/json`<br>`GET /networks`<br>`GET /volumes`<br>`GET /version` | Queries all healthy downstreams in parallel. Merges lists and deduplicates entities by ID. Updates entity affinity cache with observed container and network locations. |
+| **Fan-Out Stream Multiplexing** | `GET /events`<br>`GET /events/*` | Connects in parallel to all healthy downstreams using streaming HTTP connections. Multiplexes newline-delimited event streams from all nodes to the client in real time. Dynamically monitors for newly added or recovered nodes and attaches them to the active stream without interruption. Opportunistically populates container affinity from event metadata. |
 | **Cluster Info Aggregation** | `GET /info` | Fans out across all healthy nodes. Sums container counts (running, paused, stopped), image counts, total CPU cores, and total memory. Merges driver and system status. |
 | **Targeted Routing** | `GET /containers/{id}/*`<br>`GET /networks/{id}`<br>`GET /volumes/{name}`<br>`GET /images/{id}/*` | Checks the in-memory affinity cache to route directly to the owning node. On cache miss, sends concurrent `HEAD`/`GET` probes across healthy nodes, caches the owner, and proxies the request. |
 | **Swarm Manager Routing** | `GET /services/*`<br>`GET /tasks/*`<br>`GET /nodes/*`<br>`GET /swarm/*`<br>`GET /secrets/*`<br>`GET /configs/*` | Routes to an identified Swarm Manager. If a downstream node responds with `503` ("not a swarm manager"), SocketMesh fails over to the next healthy node and caches the active manager. |
@@ -98,7 +99,7 @@ ACL variables accept `1`, `true`, `yes` (enabled) or `0`, `false`, `no` (disable
 | `SYSTEM` | `--system` | `0` | `/system/df` (Disk usage) |
 | `DISTRIBUTION` | `--distribution` | `0` | `/distribution/*` (Registry manifest/image info) |
 | `PLUGINS` | `--plugins` | `0` | `/plugins/*` (Docker plugins list) |
-| `EVENTS` | `--events` | `0` | *Not implemented* (returns `501 Not Implemented`) |
+| `EVENTS` | `--events` | `0` | `/events` (Real-time Docker engine events streaming) |
 
 ---
 
@@ -217,7 +218,7 @@ socketmesh --healthcheck --listen :2375
 SocketMesh intentionally prohibits all write operations. Any attempt to send `POST`, `PUT`, `DELETE`, `PATCH`, or `CONNECT` requests (e.g. `docker run`, `docker stop`, `docker exec`) returns `403 Forbidden`. If mutating environment variables from earlier socket proxies (e.g. `POST=1`, `BUILD=1`, `EXEC=1`) are detected, SocketMesh emits a prominent warning at startup reminding operators that write requests will not be passed downstream.
 
 ### 2. The `/events` Endpoint
-Real-time event streaming (`GET /events`) is intentionally not implemented and returns `501 Not Implemented`. Multiplexing long-lived, stateful HTTP streams from dozens of distinct Docker engines without an intermediary broker causes unbounded memory growth, head-of-line blocking, and broken reconnect guarantees. Dashboards should poll `/containers/json` at regular intervals instead.
+SocketMesh supports real-time Docker engine event streaming via `GET /events` (enabled with `EVENTS=1` or `--events`). SocketMesh connects to all currently healthy downstream engines in parallel and merges newline-delimited event streams onto the client response in real time. Query parameters (`since`, `until`, `filters`, etc.) and request headers are forwarded to downstreams. While the event stream remains active, SocketMesh continuously monitors downstream discovery and dynamically attaches newly added or recovered nodes to the active client stream (passing `since=<now>` if no initial `since` was requested). In addition, SocketMesh inspects container events in the stream to opportunistically warm the entity affinity cache. The stream closes naturally when all downstream streams close (e.g. when an `until` timestamp is reached) or when the client cancels the request.
 
 ### 3. Container & Volume Name Collisions
 Standalone Docker daemons manage container names locally. If two disparate standalone nodes run containers named `/web-app`:

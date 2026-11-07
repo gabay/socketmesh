@@ -307,7 +307,7 @@ func TestReadOnlyEnforcement(t *testing.T) {
 	})
 }
 
-func TestEventsNotImplemented(t *testing.T) {
+func TestEventsACL(t *testing.T) {
 	endpoints := []string{
 		"/events",
 		"/events/",
@@ -327,13 +327,24 @@ func TestEventsNotImplemented(t *testing.T) {
 			for _, method := range []string{http.MethodGet, http.MethodHead} {
 				t.Run(method+" "+endpoint+FormFlagString(eventsFlag), func(t *testing.T) {
 					status, reason := Check(method, endpoint, cfg)
-					if status != http.StatusNotImplemented {
-						t.Errorf("Check(%q, %q, Events=%v) status = %d, want %d",
-							method, endpoint, eventsFlag, status, http.StatusNotImplemented)
-					}
-					if reason != ReasonEventsNotImplemented {
-						t.Errorf("Check(%q, %q, Events=%v) reason = %q, want %q",
-							method, endpoint, eventsFlag, reason, ReasonEventsNotImplemented)
+					if eventsFlag {
+						if status != http.StatusOK {
+							t.Errorf("Check(%q, %q, Events=true) status = %d, want %d",
+								method, endpoint, status, http.StatusOK)
+						}
+						if reason != "" {
+							t.Errorf("Check(%q, %q, Events=true) reason = %q, want empty",
+								method, endpoint, reason)
+						}
+					} else {
+						if status != http.StatusForbidden {
+							t.Errorf("Check(%q, %q, Events=false) status = %d, want %d",
+								method, endpoint, status, http.StatusForbidden)
+						}
+						if reason != ReasonACLDenied {
+							t.Errorf("Check(%q, %q, Events=false) reason = %q, want %q",
+								method, endpoint, reason, ReasonACLDenied)
+						}
 					}
 				})
 			}
@@ -534,6 +545,19 @@ func TestACLCategories(t *testing.T) {
 				"/plugins/my-plugin",
 				"/v1.45/plugins",
 				"/v1.45/plugins/my-plugin",
+			},
+		},
+		{
+			name: "Events",
+			setFlag: func(cfg *config.ACLConfig, val bool) {
+				cfg.Events = val
+			},
+			validPaths: []string{
+				"/events",
+				"/events/stream",
+				"/v1.44/events",
+				"/v1.44/events/stream",
+				"/v1.45/events",
 			},
 		},
 	}
@@ -741,8 +765,9 @@ func TestMiddleware(t *testing.T) {
 		}
 	})
 
-	t.Run("events endpoint returns 501 JSON", func(t *testing.T) {
+	t.Run("events endpoint returns 403 when disabled", func(t *testing.T) {
 		cfg := allACLsEnabled()
+		cfg.Events = false
 
 		nextCalled := false
 		next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -759,8 +784,8 @@ func TestMiddleware(t *testing.T) {
 		if nextCalled {
 			t.Fatal("expected next handler NOT to be called")
 		}
-		if rec.Code != http.StatusNotImplemented {
-			t.Errorf("status code = %d, want %d", rec.Code, http.StatusNotImplemented)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("status code = %d, want %d", rec.Code, http.StatusForbidden)
 		}
 		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 			t.Errorf("Content-Type = %q, want %q", ct, "application/json")
@@ -774,8 +799,33 @@ func TestMiddleware(t *testing.T) {
 		if err := json.Unmarshal(body, &resp); err != nil {
 			t.Fatalf("failed to unmarshal JSON body %q: %v", string(body), err)
 		}
-		if resp.Message != ReasonEventsNotImplemented {
-			t.Errorf("resp.Message = %q, want %q", resp.Message, ReasonEventsNotImplemented)
+		if resp.Message != ReasonACLDenied {
+			t.Errorf("resp.Message = %q, want %q", resp.Message, ReasonACLDenied)
+		}
+	})
+
+	t.Run("events endpoint forwards when enabled", func(t *testing.T) {
+		cfg := allACLsEnabled()
+		cfg.Events = true
+
+		nextCalled := false
+		next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			nextCalled = true
+			w.WriteHeader(http.StatusOK)
+		})
+
+		handler := Middleware(cfg, next)
+
+		req := httptest.NewRequest(http.MethodGet, "/v1.44/events", nil)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if !nextCalled {
+			t.Fatal("expected next handler to be called")
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("status code = %d, want %d", rec.Code, http.StatusOK)
 		}
 	})
 }

@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +49,7 @@ func WithResponseCache(cache *ResponseCache) Option {
 }
 
 // WithLogger sets the structured logger for the proxy.
+// WithLogger sets a custom logger on the Proxy.
 func WithLogger(logger *slog.Logger) Option {
 	return func(p *Proxy) {
 		if logger != nil {
@@ -54,18 +58,28 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
+// WithEventsPollInterval configures the polling interval for discovering new endpoints during /events streaming.
+func WithEventsPollInterval(d time.Duration) Option {
+	return func(p *Proxy) {
+		if d > 0 {
+			p.eventsPollInterval = d
+		}
+	}
+}
+
 // Proxy coordinates routing, fan-out aggregation, affinity caching, and failover
 // across Docker daemon downstreams.
 type Proxy struct {
-	cfg           *config.Config
-	discovery     *discovery.Manager
-	affinity      *AffinityCache
-	cache         *ResponseCache
-	client        *http.Client
-	logger        *slog.Logger
-	handler       http.Handler
-	mgrMu         sync.RWMutex
-	swarmManagers map[string]bool
+	cfg                *config.Config
+	discovery          *discovery.Manager
+	affinity           *AffinityCache
+	cache              *ResponseCache
+	client             *http.Client
+	logger             *slog.Logger
+	handler            http.Handler
+	mgrMu              sync.RWMutex
+	swarmManagers      map[string]bool
+	eventsPollInterval time.Duration
 }
 
 // NewProxy creates and initializes a Proxy with the provided configuration and discovery manager.
@@ -93,11 +107,12 @@ func NewProxy(cfg *config.Config, disc *discovery.Manager, opts ...Option) *Prox
 	}
 
 	p := &Proxy{
-		cfg:           cfg,
-		discovery:     disc,
-		affinity:      NewAffinityCache(),
-		logger:        slog.Default(),
-		swarmManagers: make(map[string]bool),
+		cfg:                cfg,
+		discovery:          disc,
+		affinity:           NewAffinityCache(),
+		logger:             slog.Default(),
+		swarmManagers:      make(map[string]bool),
+		eventsPollInterval: 2 * time.Second,
 		client: &http.Client{
 			Transport: tr,
 		},
@@ -143,6 +158,12 @@ func (p *Proxy) route(w http.ResponseWriter, r *http.Request) {
 			p.writeResponse(w, entry.StatusCode, entry.Header, entry.Body)
 			return
 		}
+	}
+
+	// Strategy E: Events Streaming Fan-Out
+	if cleanPath == "/events" || strings.HasPrefix(cleanPath, "/events/") {
+		p.handleStreamEvents(w, r, r.URL.Path)
+		return
 	}
 
 	// Strategy A: Fan-Out & Merge JSON Arrays
@@ -1652,4 +1673,342 @@ func toFloat(v any) float64 {
 		}
 	}
 	return 0
+}
+
+// --- Strategy E: Events Streaming Fan-Out ---
+
+type dockerEventMessage struct {
+Type   string `json:"Type"`
+Action string `json:"Action"`
+Actor  struct {
+	ID         string            `json:"ID"`
+	Attributes map[string]string `json:"Attributes"`
+} `json:"Actor"`
+}
+
+func (p *Proxy) inspectEventAffinity(line []byte, endpoint string) {
+if p.affinity == nil {
+	return
+}
+if !bytes.Contains(line, []byte(`"container"`)) {
+	return
+}
+var ev dockerEventMessage
+if err := json.Unmarshal(line, &ev); err != nil {
+	return
+}
+if ev.Type == "container" && ev.Actor.ID != "" {
+	var names []string
+	if name, ok := ev.Actor.Attributes["name"]; ok && name != "" {
+		names = append(names, strings.TrimPrefix(name, "/"))
+	}
+	p.affinity.SetContainer(ev.Actor.ID, names, endpoint)
+}
+}
+
+func (p *Proxy) connectDownstreamEvents(ctx context.Context, endpoint string, r *http.Request, rawPath string, isDynamic bool) (*http.Response, error) {
+targetURL := strings.TrimRight(endpoint, "/") + rawPath
+if isDynamic {
+	q := r.URL.Query()
+	if q.Get("since") == "" {
+		q.Set("since", strconv.FormatInt(time.Now().Unix(), 10))
+	}
+	if enc := q.Encode(); enc != "" {
+		targetURL += "?" + enc
+	}
+} else {
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+}
+
+outReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, nil)
+if err != nil {
+	return nil, err
+}
+copyRequestHeaders(r.Header, outReq.Header)
+
+resp, err := p.client.Do(outReq)
+if err != nil {
+	if !isClientCanceled(ctx, err) {
+		p.discovery.MarkUnhealthy(endpoint)
+		p.logger.Warn("downstream events connection failed", "endpoint", endpoint, "err", err)
+	}
+	return nil, err
+}
+
+if resp.StatusCode != http.StatusOK {
+	resp.Body.Close()
+	if !isClientCanceled(ctx, nil) {
+		p.discovery.MarkUnhealthy(endpoint)
+		p.logger.Warn("downstream events returned non-200 status", "endpoint", endpoint, "status", resp.StatusCode)
+	}
+	return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, endpoint)
+}
+
+return resp, nil
+}
+
+func (p *Proxy) readEventStream(ctx context.Context, cancel context.CancelFunc, endpoint string, resp *http.Response, w http.ResponseWriter, writeMu *sync.Mutex, flusher http.Flusher) {
+defer resp.Body.Close()
+
+reader := bufio.NewReader(resp.Body)
+for {
+	line, err := reader.ReadBytes('\n')
+	if len(line) > 0 {
+		p.inspectEventAffinity(line, endpoint)
+
+		writeMu.Lock()
+		_, wErr := w.Write(line)
+		if wErr == nil && flusher != nil {
+			flusher.Flush()
+		}
+		writeMu.Unlock()
+
+		if wErr != nil {
+			cancel()
+			return
+		}
+	}
+
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if !isClientCanceled(ctx, err) {
+			p.discovery.MarkUnhealthy(endpoint)
+			p.logger.Warn("downstream events stream read error", "endpoint", endpoint, "err", err)
+		}
+		return
+	}
+}
+}
+
+func (p *Proxy) handleStreamEvents(w http.ResponseWriter, r *http.Request, rawPath string) {
+endpoints := p.discovery.HealthyEndpoints()
+if len(endpoints) == 0 {
+	http.Error(w, `{"message":"no healthy downstream endpoints"}`, http.StatusBadGateway)
+	return
+}
+
+ctx, cancel := context.WithCancel(r.Context())
+defer cancel()
+
+activeStreams := make(map[string]bool)
+var activeMu sync.Mutex
+var streamWG sync.WaitGroup
+var writeMu sync.Mutex
+allClosedCh := make(chan struct{}, 1)
+
+flusher, _ := w.(http.Flusher)
+
+type initResult struct {
+	ep   string
+	resp *http.Response
+	err  error
+}
+
+initCh := make(chan initResult, len(endpoints))
+
+for _, ep := range endpoints {
+	activeMu.Lock()
+	activeStreams[ep] = true
+	activeMu.Unlock()
+
+	go func(endpoint string) {
+		resp, err := p.connectDownstreamEvents(ctx, endpoint, r, rawPath, false)
+		initCh <- initResult{ep: endpoint, resp: resp, err: err}
+	}(ep)
+}
+
+var firstSuccess *initResult
+failCount := 0
+
+for failCount < len(endpoints) {
+	select {
+	case <-ctx.Done():
+		return
+	case res := <-initCh:
+		if res.err != nil {
+			activeMu.Lock()
+			delete(activeStreams, res.ep)
+			activeMu.Unlock()
+			failCount++
+		} else {
+			firstSuccess = &res
+			break
+		}
+	}
+	if firstSuccess != nil {
+		break
+	}
+}
+
+if firstSuccess == nil {
+	http.Error(w, `{"message":"all downstream endpoints failed"}`, http.StatusBadGateway)
+	return
+}
+
+// Forward response headers from the first responding downstream
+for k, vv := range firstSuccess.resp.Header {
+	if isHopByHop(k) {
+		continue
+	}
+	for _, v := range vv {
+		w.Header().Add(k, v)
+	}
+}
+w.Header().Del("Content-Length")
+if w.Header().Get("Content-Type") == "" {
+	w.Header().Set("Content-Type", "application/json")
+}
+w.WriteHeader(http.StatusOK)
+if flusher != nil {
+	flusher.Flush()
+}
+
+	// Process remaining initial connections in background
+	remCount := len(endpoints) - failCount - 1
+	if r.Method == http.MethodHead {
+		firstSuccess.resp.Body.Close()
+		cancel()
+		if remCount > 0 {
+			go func(count int) {
+				for i := 0; i < count; i++ {
+					res := <-initCh
+					if res.resp != nil {
+						res.resp.Body.Close()
+					}
+				}
+			}(remCount)
+		}
+		return
+	}
+
+	// Start reader goroutine for first successful connection
+	streamWG.Add(1)
+	go func(endpoint string, resp *http.Response) {
+		defer streamWG.Done()
+		defer func() {
+			activeMu.Lock()
+			delete(activeStreams, endpoint)
+			rem := len(activeStreams)
+			activeMu.Unlock()
+			if rem == 0 {
+				select {
+				case allClosedCh <- struct{}{}:
+				default:
+				}
+			}
+		}()
+		p.readEventStream(ctx, cancel, endpoint, resp, w, &writeMu, flusher)
+	}(firstSuccess.ep, firstSuccess.resp)
+
+	if remCount > 0 {
+		streamWG.Add(1)
+		go func(count int) {
+			defer streamWG.Done()
+			for i := 0; i < count; i++ {
+				res := <-initCh
+				if res.err != nil {
+					activeMu.Lock()
+					delete(activeStreams, res.ep)
+					rem := len(activeStreams)
+					activeMu.Unlock()
+					if rem == 0 {
+						select {
+						case allClosedCh <- struct{}{}:
+						default:
+						}
+					}
+				} else {
+					if ctx.Err() != nil {
+						res.resp.Body.Close()
+						activeMu.Lock()
+						delete(activeStreams, res.ep)
+						activeMu.Unlock()
+						continue
+					}
+					streamWG.Add(1)
+					go func(endpoint string, resp *http.Response) {
+						defer streamWG.Done()
+						defer func() {
+							activeMu.Lock()
+							delete(activeStreams, endpoint)
+							rem := len(activeStreams)
+							activeMu.Unlock()
+							if rem == 0 {
+								select {
+								case allClosedCh <- struct{}{}:
+								default:
+								}
+							}
+						}()
+						p.readEventStream(ctx, cancel, endpoint, resp, w, &writeMu, flusher)
+					}(res.ep, res.resp)
+				}
+			}
+		}(remCount)
+	}
+
+// Dynamic monitoring loop
+pollInterval := p.eventsPollInterval
+if pollInterval <= 0 {
+	pollInterval = 2 * time.Second
+}
+ticker := time.NewTicker(pollInterval)
+defer ticker.Stop()
+
+for {
+	select {
+	case <-r.Context().Done():
+		cancel()
+		streamWG.Wait()
+		return
+	case <-allClosedCh:
+		activeMu.Lock()
+		rem := len(activeStreams)
+		activeMu.Unlock()
+		if rem == 0 {
+			cancel()
+			streamWG.Wait()
+			return
+		}
+	case <-ticker.C:
+		healthy := p.discovery.HealthyEndpoints()
+		for _, ep := range healthy {
+			activeMu.Lock()
+			isActive := activeStreams[ep]
+			if !isActive {
+				activeStreams[ep] = true
+			}
+			activeMu.Unlock()
+
+			if !isActive {
+				streamWG.Add(1)
+				go func(endpoint string) {
+					defer streamWG.Done()
+					defer func() {
+						activeMu.Lock()
+						delete(activeStreams, endpoint)
+						rem := len(activeStreams)
+						activeMu.Unlock()
+						if rem == 0 {
+							select {
+							case allClosedCh <- struct{}{}:
+							default:
+							}
+						}
+					}()
+
+					resp, err := p.connectDownstreamEvents(ctx, endpoint, r, rawPath, true)
+					if err != nil {
+						return
+					}
+					p.readEventStream(ctx, cancel, endpoint, resp, w, &writeMu, flusher)
+				}(ep)
+			}
+		}
+	}
+}
 }

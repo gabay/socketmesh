@@ -255,8 +255,8 @@ func TestRun_StartupWarnings(t *testing.T) {
 	if !strings.Contains(logOutput, "Write/mutating environment variables detected") {
 		t.Errorf("expected write env warning in log output, got:\n%s", logOutput)
 	}
-	if !strings.Contains(logOutput, "EVENTS=1 is set, but /events is not implemented") {
-		t.Errorf("expected EVENTS warning in log output, got:\n%s", logOutput)
+	if strings.Contains(logOutput, "EVENTS=1 is set, but /events is not implemented") {
+		t.Errorf("unexpected EVENTS warning in log output, got:\n%s", logOutput)
 	}
 }
 
