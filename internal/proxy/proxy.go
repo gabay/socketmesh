@@ -134,7 +134,16 @@ func NewProxy(cfg *config.Config, disc *discovery.Manager, opts ...Option) *Prox
 
 // ServeHTTP delegates request handling to the ACL-wrapped proxy pipeline.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	p.handler.ServeHTTP(w, r)
+
+	p.logger.Debug("served request",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"query", r.URL.RawQuery,
+		"remote", r.RemoteAddr,
+		"duration", time.Since(start),
+	)
 }
 
 // Affinity returns the underlying AffinityCache.
@@ -158,12 +167,6 @@ func (p *Proxy) route(w http.ResponseWriter, r *http.Request) {
 			p.writeResponse(w, entry.StatusCode, entry.Header, entry.Body)
 			return
 		}
-	}
-
-	// Strategy E: Events Streaming Fan-Out
-	if cleanPath == "/events" || strings.HasPrefix(cleanPath, "/events/") {
-		p.handleStreamEvents(w, r, r.URL.Path)
-		return
 	}
 
 	// Strategy A: Fan-Out & Merge JSON Arrays
@@ -213,12 +216,19 @@ func (p *Proxy) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Strategy D: Any-Healthy-Node / Swarm Manager Failover
+	// Strategy D: Swarm Manager Failover
 	if isSwarmEndpoint(cleanPath) {
 		p.handleSwarm(w, r, cleanPath, cacheKey)
 		return
 	}
 
+	// Strategy E: Events Streaming Fan-Out
+	if cleanPath == "/events" || strings.HasPrefix(cleanPath, "/events/") {
+		p.handleStreamEvents(w, r, r.URL.Path)
+		return
+	}
+
+	// Strategy D (again): Any-Healthy-Node
 	p.handleAnyHealthy(w, r, cleanPath, cacheKey)
 }
 
@@ -326,7 +336,7 @@ func (p *Proxy) handleContainersList(w http.ResponseWriter, r *http.Request, cac
 	}
 
 	header := make(http.Header)
-	copyForwardHeaders(firstRespHeader, header)
+	copyHeaders(firstRespHeader, header)
 	header.Set("Content-Type", "application/json")
 
 	p.writeResponse(w, http.StatusOK, header, merged)
@@ -392,7 +402,7 @@ func (p *Proxy) handleImagesList(w http.ResponseWriter, r *http.Request, cacheKe
 
 	merged, _ := json.Marshal(allImages)
 	header := make(http.Header)
-	copyForwardHeaders(firstRespHeader, header)
+	copyHeaders(firstRespHeader, header)
 	header.Set("Content-Type", "application/json")
 
 	p.writeResponse(w, http.StatusOK, header, merged)
@@ -470,7 +480,7 @@ func (p *Proxy) handleNetworksList(w http.ResponseWriter, r *http.Request, cache
 
 	merged, _ := json.Marshal(allNetworks)
 	header := make(http.Header)
-	copyForwardHeaders(firstRespHeader, header)
+	copyHeaders(firstRespHeader, header)
 	header.Set("Content-Type", "application/json")
 
 	p.writeResponse(w, http.StatusOK, header, merged)
@@ -539,7 +549,7 @@ func (p *Proxy) handlePluginsList(w http.ResponseWriter, r *http.Request, cacheK
 
 	merged, _ := json.Marshal(allPlugins)
 	header := make(http.Header)
-	copyForwardHeaders(firstRespHeader, header)
+	copyHeaders(firstRespHeader, header)
 	header.Set("Content-Type", "application/json")
 
 	p.writeResponse(w, http.StatusOK, header, merged)
@@ -635,7 +645,7 @@ func (p *Proxy) handleVolumesList(w http.ResponseWriter, r *http.Request, cacheK
 
 	merged, _ := json.Marshal(respObj)
 	header := make(http.Header)
-	copyForwardHeaders(firstRespHeader, header)
+	copyHeaders(firstRespHeader, header)
 	header.Set("Content-Type", "application/json")
 
 	p.writeResponse(w, http.StatusOK, header, merged)
@@ -816,7 +826,7 @@ func (p *Proxy) handleSystemDf(w http.ResponseWriter, r *http.Request, cacheKey 
 
 	merged, _ := json.Marshal(mergedObj)
 	header := make(http.Header)
-	copyForwardHeaders(firstRespHeader, header)
+	copyHeaders(firstRespHeader, header)
 	header.Set("Content-Type", "application/json")
 
 	p.writeResponse(w, http.StatusOK, header, merged)
@@ -888,7 +898,7 @@ func (p *Proxy) handleClusterInfo(w http.ResponseWriter, r *http.Request, cacheK
 
 	merged, _ := json.Marshal(base)
 	header := make(http.Header)
-	copyForwardHeaders(firstRespHeader, header)
+	copyHeaders(firstRespHeader, header)
 	header.Set("Content-Type", "application/json")
 
 	p.writeResponse(w, http.StatusOK, header, merged)
@@ -1379,7 +1389,7 @@ func (p *Proxy) probeRequest(ctx context.Context, origReq *http.Request, endpoin
 				resCh <- probeResult{endpoint: endpoint, err: err}
 				return
 			}
-			copyRequestHeaders(origReq.Header, req.Header)
+			copyHeaders(origReq.Header, req.Header)
 			resp, body, err := p.doDownstream(probeCtx, endpoint, req, false)
 			resCh <- probeResult{endpoint: endpoint, resp: resp, body: body, err: err}
 		}(ep)
@@ -1433,7 +1443,7 @@ func (p *Proxy) doDownstream(ctx context.Context, endpoint string, r *http.Reque
 	if err != nil {
 		return nil, nil, err
 	}
-	copyRequestHeaders(r.Header, outReq.Header)
+	copyHeaders(r.Header, outReq.Header)
 
 	resp, err := p.client.Do(outReq)
 	if err != nil {
@@ -1467,7 +1477,7 @@ func (p *Proxy) doRequest(ctx context.Context, endpoint string, r *http.Request,
 	if err != nil {
 		return nil, err
 	}
-	copyRequestHeaders(r.Header, outReq.Header)
+	copyHeaders(r.Header, outReq.Header)
 
 	resp, err := p.client.Do(outReq)
 	if err != nil {
@@ -1521,14 +1531,7 @@ func (p *Proxy) setSwarmManager(endpoint string, isManager bool) {
 }
 
 func (p *Proxy) writeResponse(w http.ResponseWriter, statusCode int, header http.Header, body []byte) {
-	for k, vv := range header {
-		if isHopByHop(k) {
-			continue
-		}
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
+	copyHeaders(header, w.Header())
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(body)
 }
@@ -1536,14 +1539,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, statusCode int, header http
 func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response) error {
 	defer resp.Body.Close()
 
-	for k, vv := range resp.Header {
-		if isHopByHop(k) {
-			continue
-		}
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
+	copyHeaders(resp.Header, w.Header())
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, hasFlusher := w.(http.Flusher)
@@ -1574,6 +1570,8 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response) error
 // --- Utility Helpers ---
 
 func isHopByHop(header string) bool {
+	// NOTE: content-length is not strictly hop-by-hop, but chunking all of our responses is easier
+	// than making sure the content length matches every time
 	switch strings.ToLower(header) {
 	case "connection",
 		"keep-alive",
@@ -1583,25 +1581,15 @@ func isHopByHop(header string) bool {
 		"trailer",
 		"trailers",
 		"transfer-encoding",
-		"upgrade":
+		"upgrade",
+		"content-length":
 		return true
 	default:
 		return false
 	}
 }
 
-func copyRequestHeaders(src, dst http.Header) {
-	for k, vv := range src {
-		if isHopByHop(k) {
-			continue
-		}
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
-	}
-}
-
-func copyForwardHeaders(src, dst http.Header) {
+func copyHeaders(src, dst http.Header) {
 	if src == nil || dst == nil {
 		return
 	}
@@ -1726,7 +1714,7 @@ outReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, nil)
 if err != nil {
 	return nil, err
 }
-copyRequestHeaders(r.Header, outReq.Header)
+copyHeaders(r.Header, outReq.Header)
 
 resp, err := p.client.Do(outReq)
 if err != nil {
@@ -1850,15 +1838,7 @@ if firstSuccess == nil {
 }
 
 // Forward response headers from the first responding downstream
-for k, vv := range firstSuccess.resp.Header {
-	if isHopByHop(k) {
-		continue
-	}
-	for _, v := range vv {
-		w.Header().Add(k, v)
-	}
-}
-w.Header().Del("Content-Length")
+copyHeaders(firstSuccess.resp.Header, w.Header())
 if w.Header().Get("Content-Type") == "" {
 	w.Header().Set("Content-Type", "application/json")
 }

@@ -20,6 +20,6 @@ COPY --from=builder /out/socketmesh /usr/local/bin/socketmesh
 USER socketmesh
 EXPOSE 2375
 
-HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 CMD ["/usr/local/bin/socketmesh", "--healthcheck"]
+HEALTHCHECK --timeout=3s --start-period=5s CMD ["/usr/local/bin/socketmesh", "--healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/socketmesh"]
